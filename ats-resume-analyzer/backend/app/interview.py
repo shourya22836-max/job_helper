@@ -1,33 +1,44 @@
-"""LiveKit + Deepgram + LLM-powered mock interview backend.
+"""LiveKit + LLM-powered mock interview backend.
 
-Provides:
+Owns:
 - `mint_access_token` / `ensure_room`         — LiveKit JWT + room bootstrap
 - `generate_first_question` / `generate_next_question` — adaptive question generation
 - `evaluate_answer`                           — per-Q judgement
 - `generate_feedback`                         — final report
-- `interview_ws`                              — FastAPI WebSocket handler that owns
-                                                 the audio round-trip via Deepgram
-                                                 streaming STT and the LLM helpers.
 
-The LiveKit room is used for video preview + data-channel signaling only; the
-audio round-trip runs over this WebSocket.
+The realtime voice round-trip (STT → LangGraph → TTS) runs inside a separate
+LiveKit Agents worker (see `backend/agent.py`). The frontend publishes mic +
+camera into the LiveKit room, the agent joins, listens, drives the LangGraph
+state machine, and streams its audio track back. Captions flow over the
+LiveKit data channel.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
-import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
-from fastapi import WebSocket, WebSocketDisconnect
-
 from . import llm_analyzer, roles_data
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# TLS / SSL                                                                   #
+# --------------------------------------------------------------------------- #
+# On some macOS Python installs (notably the python.org installer) the system
+# CA bundle is missing, so connections to livekit.cloud fail with
+# `CERTIFICATE_VERIFY_FAILED`. Pointing SSL_CERT_FILE at certifi's bundle —
+# which `certifi` ships inside the venv — fixes it without disabling
+# verification globally.
+try:
+    import certifi  # noqa: WPS433 (import inside try)
+    os.environ.setdefault("SSL_CERT_FILE", certifi.where())
+except ImportError:  # pragma: no cover
+    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -89,7 +100,7 @@ TYPE_GUIDANCE: Dict[str, str] = {
 
 
 # --------------------------------------------------------------------------- #
-# LiveKit + Deepgram env helpers
+# LiveKit env helpers
 # --------------------------------------------------------------------------- #
 def _require_livekit_env() -> tuple[str, str, str]:
     url = os.getenv("LIVEKIT_URL", "").strip()
@@ -101,16 +112,6 @@ def _require_livekit_env() -> tuple[str, str, str]:
             "to backend/.env (free tier: https://cloud.livekit.io)."
         )
     return url, key, secret
-
-
-def _require_deepgram_env() -> str:
-    key = os.getenv("DEEPGRAM_API_KEY", "").strip()
-    if not key:
-        raise RuntimeError(
-            "DEEPGRAM_API_KEY is not set in backend/.env "
-            "(free tier: https://console.deepgram.com)."
-        )
-    return key
 
 
 def server_url() -> str:
@@ -143,8 +144,13 @@ def mint_access_token(room_name: str, identity: str, *, ttl_seconds: int = 3600)
     return token, url
 
 
-async def ensure_room(room_name: str) -> None:
-    """Best-effort room creation. Failures are logged but do not raise."""
+async def ensure_room(room_name: str, *, metadata: Optional[str] = None) -> None:
+    """Best-effort room creation. Failures are logged but do not raise.
+
+    If `metadata` is provided it is attached to the LiveKit room so that the
+    voice agent (backend/agent.py) can read the interview config (role, type,
+    question count, resume text) when it joins the room.
+    """
     try:
         url, api_key, api_secret = _require_livekit_env()
     except RuntimeError:
@@ -156,7 +162,10 @@ async def ensure_room(room_name: str) -> None:
 
         lk = LiveKitAPI(url=url, api_key=api_key, api_secret=api_secret)
         try:
-            await lk.room.create_room(CreateRoomRequest(name=room_name))
+            req = CreateRoomRequest(name=room_name)
+            if metadata:
+                req.metadata = metadata
+            await lk.room.create_room(req)
         finally:
             await lk.aclose()
     except Exception as exc:  # noqa: BLE001
@@ -445,349 +454,6 @@ def _fallback_question(role: dict, interview_type: str, index: int) -> str:
 
 
 # --------------------------------------------------------------------------- #
-# WebSocket handler
-# --------------------------------------------------------------------------- #
-async def _ws_send(websocket: WebSocket, payload: dict) -> None:
-    try:
-        await websocket.send_text(json.dumps(payload, ensure_ascii=False))
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("ws send failed: %s", exc)
-
-
-async def interview_ws(websocket: WebSocket, interview_id: str) -> None:
-    """Audio round-trip endpoint: PCM frames in, JSON events out.
-
-    The Deepgram live transcription runs in a background task; its events
-    are pushed into an asyncio.Queue which the main control loop also reads.
-    """
-    await websocket.accept()
-    logger.info("interview_ws open: %s", interview_id)
-
-    # --- 1. Initial config frame ------------------------------------------
-    try:
-        cfg_raw = await websocket.receive_text()
-        cfg = json.loads(cfg_raw)
-    except (WebSocketDisconnect, json.JSONDecodeError, Exception) as exc:  # noqa: BLE001
-        await _ws_send(websocket, {"type": "error", "message": f"Bad config: {exc}"})
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    role_id = str(cfg.get("role_id") or "").strip()
-    interview_type = str(cfg.get("interview_type") or "technical").strip()
-    if interview_type not in {"hr", "technical", "behavioral"}:
-        interview_type = "technical"
-    try:
-        question_count = max(2, min(int(cfg.get("question_count") or 6), 12))
-    except (TypeError, ValueError):
-        question_count = 6
-    resume_text = cfg.get("resume_text") or None
-    if isinstance(resume_text, str) and not resume_text.strip():
-        resume_text = None
-
-    role = roles_data.get_role(role_id)
-    if not role:
-        await _ws_send(websocket, {"type": "error", "message": f"Unknown role_id: {role_id}"})
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    # --- 2. Deepgram live STT setup ---------------------------------------
-    try:
-        dg_key = _require_deepgram_env()
-    except RuntimeError as exc:
-        await _ws_send(websocket, {"type": "error", "message": str(exc)})
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    dg = None
-    dg_connection = None
-    try:
-        from deepgram import DeepgramClient
-        from deepgram.clients.listen.v1 import LiveOptions
-        from deepgram.clients.listen import LiveTranscriptionEvents
-        dg = DeepgramClient(api_key=dg_key)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Deepgram init failed")
-        await _ws_send(websocket, {"type": "error", "message": f"Deepgram unavailable: {exc}"})
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    # Events queue — items are dicts: {"kind": "interim"|"final"|"utterance_end"|"error", "text": "..."}
-    events: asyncio.Queue = asyncio.Queue()
-    loop = asyncio.get_running_loop()
-
-    def _dg_callback(coro_fn):
-        """Wrap an async callback so it can be registered with the 3.4.0 SDK.
-
-        Deepgram's internal _listening() coroutine invokes these handlers via
-        _emit(event, *args). To keep the queue thread-safe we schedule the work
-        onto the running asyncio loop.
-        """
-        def _cb(*args, **kwargs):
-            try:
-                loop.call_soon_threadsafe(lambda: asyncio.create_task(coro_fn(*args, **kwargs)))
-            except RuntimeError:
-                # Loop closed (interview ending) — drop the event quietly.
-                pass
-        return _cb
-
-    async def _on_dg_transcript(*args, **kwargs) -> None:
-        # 3.4.0 _emit signature for Transcript: handler(self, result, **kwargs)
-        result = kwargs.get("result")
-        if result is None and len(args) > 1:
-            result = args[1]
-        if result is None:
-            return
-        try:
-            channel = getattr(result, "channel", None)
-            alternatives = getattr(channel, "alternatives", []) if channel else []
-            alt = alternatives[0] if alternatives else None
-            text = (getattr(alt, "transcript", "") if alt else "") or ""
-            is_final = bool(getattr(result, "is_final", False))
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("dg transcript parse error: %s", exc)
-            return
-        text = (text or "").strip()
-        if not text:
-            return
-        await events.put({"kind": "final" if is_final else "interim", "text": text})
-
-    async def _on_dg_utterance_end() -> None:
-        await events.put({"kind": "utterance_end", "text": ""})
-
-    async def _on_dg_error(*args, **kwargs) -> None:
-        err = kwargs.get("error")
-        if err is None and len(args) > 1:
-            err = args[1]
-        if err is None and args:
-            err = args[0]
-        logger.warning("Deepgram error: %s", err)
-        await events.put({"kind": "error", "text": str(err) if err else "unknown"})
-
-    try:
-        live_options = LiveOptions(
-            model="nova-2",
-            language="en",
-            encoding="linear16",
-            sample_rate=16000,
-            channels=1,
-            smart_format=True,
-            interim_results=True,
-            endpointing=300,
-            utterance_end_ms=1000,
-            vad_events=True,
-        )
-
-        # 3.4.0 surface: dg.listen.asyncwebsocket.v("1") returns the async
-        # client whose start()/send()/finish() are coroutines.
-        dg_connection = dg.listen.asyncwebsocket.v("1")
-        dg_connection.on(LiveTranscriptionEvents.Transcript, _dg_callback(_on_dg_transcript))
-        dg_connection.on(LiveTranscriptionEvents.UtteranceEnd, _dg_callback(_on_dg_utterance_end))
-        dg_connection.on(LiveTranscriptionEvents.Error, _dg_callback(_on_dg_error))
-
-        started_ok = await dg_connection.start(live_options)
-        if not started_ok:
-            await _ws_send(websocket, {"type": "error", "message": "Could not start Deepgram stream."})
-            try:
-                await websocket.close()
-            except Exception:  # noqa: BLE001
-                pass
-            return
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("Deepgram start failed")
-        await _ws_send(websocket, {"type": "error", "message": f"Deepgram start failed: {exc}"})
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        return
-
-    # --- 3. State + first question ----------------------------------------
-    transcript: List[dict] = []
-    state = "asking"  # asking | ai_thinking | paused | ended
-    question_index = 0
-    current_question = generate_first_question(
-        role=role, interview_type=interview_type, resume_text=resume_text,
-    )
-    transcript.append({"role": "assistant", "text": current_question, "timestamp": time.time()})
-    await _ws_send(websocket, {
-        "type": "question",
-        "text": current_question,
-        "index": question_index,
-        "total": question_count,
-    })
-
-    async def _ai_turn() -> None:
-        nonlocal state, question_index, current_question
-        state = "ai_thinking"
-        await _ws_send(websocket, {"type": "ai_thinking"})
-
-        msgs: List[dict] = [{"role": "system", "content": INTERVIEWER_SYSTEM_PROMPT}]
-        msgs.append({
-            "role": "system",
-            "content": (
-                f"{_interview_type_block(interview_type)}\n\n{_role_brief(role)}\n\n"
-                + (f"CANDIDATE RESUME (truncated):\n{resume_text[:3000]}" if resume_text else "")
-            ),
-        })
-        for t in transcript[-8:]:
-            msgs.append({"role": t["role"], "content": t["text"]})
-
-        try:
-            text = await asyncio.wait_for(
-                asyncio.to_thread(llm_analyzer._call_chat_text, msgs, temperature=0.6, max_tokens=400),
-                timeout=90,
-            )
-            text = (text or "").strip()
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("AI reply failed")
-            await _ws_send(websocket, {"type": "ai_timeout", "message": str(exc)})
-            text = "Thanks — let's move on."
-
-        if not text:
-            text = "Thanks — let's move on."
-
-        transcript.append({"role": "assistant", "text": text, "timestamp": time.time()})
-        await _ws_send(websocket, {"type": "caption", "role": "assistant", "text": text, "final": True})
-
-        next_idx = question_index + 1
-        if next_idx >= question_count:
-            await _ws_send(websocket, {"type": "ai_done"})
-            await _ws_send(websocket, {"type": "complete"})
-            state = "ended"
-            return
-
-        nq = generate_next_question(
-            role=role, interview_type=interview_type, resume_text=resume_text,
-            prior_turns=transcript, question_index=next_idx, total=question_count,
-        )
-        question_index = next_idx
-        current_question = nq
-        transcript.append({"role": "assistant", "text": nq, "timestamp": time.time()})
-        await _ws_send(websocket, {"type": "ai_done"})
-        await _ws_send(websocket, {"type": "question", "text": nq, "index": next_idx, "total": question_count})
-        state = "asking"
-
-    # --- 4. Main loop: websocket + Deepgram queue --------------------------
-    try:
-        while True:
-            receiver_task = asyncio.create_task(websocket.receive())
-            event_task = asyncio.create_task(events.get())
-            done, pending = await asyncio.wait(
-                {receiver_task, event_task},
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-            # Cancel the still-pending task so the loop doesn't leak.
-            for t in pending:
-                t.cancel()
-
-            # If the Deepgram queue task finished first, handle it.
-            if event_task in done:
-                try:
-                    dg_event = event_task.result()
-                except Exception as exc:  # noqa: BLE001
-                    logger.warning("event_task raised: %s", exc)
-                    dg_event = None
-                if isinstance(dg_event, dict):
-                    kind = dg_event.get("kind")
-                    text = (dg_event.get("text") or "").strip()
-                    if text:
-                        await _ws_send(websocket, {"type": "caption", "role": "user", "text": text, "final": kind == "final"})
-                    if kind == "final" and text and state == "asking":
-                        transcript.append({"role": "user", "text": text, "timestamp": time.time()})
-                        await _ai_turn()
-                continue
-
-            # Otherwise the WebSocket produced a frame.
-            try:
-                ws_msg = receiver_task.result()
-            except WebSocketDisconnect:
-                logger.info("interview_ws client disconnected: %s", interview_id)
-                break
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("ws receive failed: %s", exc)
-                break
-
-            if ws_msg.get("type") != "websocket.receive":
-                continue
-
-            if "bytes" in ws_msg and ws_msg["bytes"] is not None:
-                if dg_connection is not None and state == "asking":
-                    try:
-                        await dg_connection.send(ws_msg["bytes"])
-                    except Exception as exc:  # noqa: BLE001
-                        logger.warning("send to Deepgram failed: %s", exc)
-                continue
-
-            if "text" in ws_msg and ws_msg["text"] is not None:
-                try:
-                    ctrl = json.loads(ws_msg["text"])
-                except json.JSONDecodeError:
-                    continue
-                ctype = ctrl.get("type")
-
-                if ctype == "text":
-                    user_text = str(ctrl.get("text", "")).strip()
-                    if user_text and state == "asking":
-                        await _ws_send(websocket, {"type": "caption", "role": "user", "text": user_text, "final": True})
-                        transcript.append({"role": "user", "text": user_text, "timestamp": time.time()})
-                        await _ai_turn()
-                elif ctype == "skip":
-                    question_index += 1
-                    if question_index >= question_count:
-                        await _ws_send(websocket, {"type": "complete"})
-                        state = "ended"
-                        break
-                    nq = generate_next_question(
-                        role=role, interview_type=interview_type, resume_text=resume_text,
-                        prior_turns=transcript, question_index=question_index, total=question_count,
-                    )
-                    current_question = nq
-                    transcript.append({"role": "assistant", "text": nq, "timestamp": time.time()})
-                    await _ws_send(websocket, {"type": "question", "text": nq, "index": question_index, "total": question_count})
-                elif ctype == "pause":
-                    if state == "asking":
-                        state = "paused"
-                        await _ws_send(websocket, {"type": "paused"})
-                elif ctype == "resume":
-                    if state == "paused":
-                        state = "asking"
-                        await _ws_send(websocket, {"type": "resumed"})
-                elif ctype == "end":
-                    state = "ended"
-                    break
-
-    except WebSocketDisconnect:
-        logger.info("interview_ws client disconnected: %s", interview_id)
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("interview_ws crashed: %s", exc)
-        try:
-            await _ws_send(websocket, {"type": "error", "message": str(exc)})
-        except Exception:  # noqa: BLE001
-            pass
-    finally:
-        if dg_connection is not None:
-            try:
-                await dg_connection.finish()
-            except Exception:  # noqa: BLE001
-                pass
-        try:
-            await websocket.close()
-        except Exception:  # noqa: BLE001
-            pass
-        logger.info("interview_ws closed: %s", interview_id)
-
 
 def new_interview_id() -> str:
     return f"iv_{uuid.uuid4().hex[:12]}"

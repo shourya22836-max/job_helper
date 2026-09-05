@@ -114,6 +114,8 @@ class InterviewStartResponse(BaseModel):
     question_count: int
     first_question: str
     interview_id: str
+    avatar_provider: str = "local"
+    avatar_session: Optional[dict[str, Any]] = None
 
 
 class InterviewFeedbackRequest(BaseModel):

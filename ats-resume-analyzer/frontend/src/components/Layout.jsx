@@ -1,11 +1,23 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { Outlet } from 'react-router-dom'
 import Sidebar from './Sidebar.jsx'
 import { useHistory } from '../context/HistoryContext.jsx'
 
 export default function Layout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
-  const { current } = useHistory()
+  const { current, settings } = useHistory()
+
+  // Mirror settings.theme onto <html data-theme="..."> so the dark-mode CSS
+  // tokens in styles.css take effect. Removing the attribute (instead of
+  // setting "light") lets the bare `:root` rules win for the default theme.
+  useEffect(() => {
+    const root = document.documentElement
+    if (settings?.theme === 'dark') {
+      root.dataset.theme = 'dark'
+    } else {
+      delete root.dataset.theme
+    }
+  }, [settings?.theme])
 
   return (
     <div className="layout">

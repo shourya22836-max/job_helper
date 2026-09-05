@@ -1,15 +1,19 @@
 """FastAPI entry point for the AI Resume Assistant."""
 from __future__ import annotations
 
+import json
 import logging
 import os
 import uuid
+from dataclasses import asdict
 from pathlib import Path
+from typing import Optional
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import ats_checks, extractor, interview, llm_analyzer, roles_data
+from .services.avatar import AvatarProviderFactory, AvatarSession
 from .schemas import (
     AnalyzeResponse,
     ChatRequest,
@@ -246,11 +250,42 @@ async def start_interview(req: InterviewStartRequest) -> InterviewStartResponse:
     except RuntimeError as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
 
-    await interview.ensure_room(room_name)
+    # Encode the interview config in the LiveKit room's metadata so the
+    # voice agent (backend/agent.py) can read it when it joins the room.
+    room_metadata = json.dumps({
+        "interview_id": interview_id,
+        "interview_type": req.interview_type,
+        "question_count": question_count,
+        "role": role,
+        "resume_text": req.resume_text or "",
+    })
+    await interview.ensure_room(room_name, metadata=room_metadata)
 
+    # Pre-generate the first question so the UI can show it as a caption while
+    # the agent connects. The LiveKit agent will also speak it once it joins.
     first_q = interview.generate_first_question(
         role=role, interview_type=req.interview_type, resume_text=req.resume_text,
     )
+
+    # Create avatar session (backend-only secrets; frontend gets session config)
+    avatar_provider_name = os.getenv("AVATAR_PROVIDER", "local").lower().strip()
+    avatar_session = None
+    try:
+        avatar_provider = AvatarProviderFactory.create_from_env()
+        avatar_config = AvatarProviderFactory._PROVIDERS.get(avatar_provider_name)
+        if avatar_config:
+            from .services.avatar import AvatarConfig
+            config = AvatarConfig()
+            avatar_session = await avatar_provider.create_session(config)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Avatar session creation failed, using local fallback: %s", exc)
+        # Local fallback
+        from .services.avatar import LocalAvatarProvider, AvatarConfig
+        local_provider = LocalAvatarProvider()
+        avatar_session = await local_provider.create_session(AvatarConfig())
+
+    # Convert AvatarSession dataclass to dict for Pydantic response
+    avatar_session_dict = asdict(avatar_session) if avatar_session else None
 
     return InterviewStartResponse(
         room_name=room_name,
@@ -262,6 +297,8 @@ async def start_interview(req: InterviewStartRequest) -> InterviewStartResponse:
         question_count=question_count,
         first_question=first_q,
         interview_id=interview_id,
+        avatar_provider=avatar_provider_name,
+        avatar_session=avatar_session_dict,
     )
 
 
@@ -304,5 +341,22 @@ async def interview_feedback(req: InterviewFeedbackRequest) -> InterviewFeedback
     return InterviewFeedbackResponse(**feedback)
 
 
-# Register the WebSocket route (audio round-trip via Deepgram).
-app.add_api_websocket_route("/api/interview/ws/{interview_id}", interview.interview_ws)
+# --------------------------------------------------------------------------- #
+# Interview — runtime config (frontend polls this to know if the agent is ready
+# to join, what the question count is, etc.). Currently a passthrough that
+# reads the role + question_count set when /api/interview/token was called.
+# --------------------------------------------------------------------------- #
+@app.get("/api/interview/status/{interview_id}")
+def interview_status(interview_id: str) -> dict:
+    """Best-effort status. The LiveKit room is the source of truth for
+    agent presence; this endpoint lets the UI show a friendly message while
+    it waits for the agent worker to spin up.
+    """
+    return {
+        "interview_id": interview_id,
+        "agent_required": True,
+        "agent_help": (
+            "If the AI never joins, start the voice agent worker with "
+            "`python agent.py dev` from the backend directory."
+        ),
+    }

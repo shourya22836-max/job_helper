@@ -2,55 +2,45 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
 import { fetchRoles, getInterviewFeedback, startInterview } from '../lib/api.js'
 import { useHistory } from '../context/HistoryContext.jsx'
+import { useSpeechRecognition } from '../hooks/useSpeechRecognition.js'
+import { useBrowserTTS } from '../hooks/useBrowserTTS.js'
+// InterviewerAvatar is lazy-loaded below to keep the initial bundle small
+// and supports multiple providers (local 3D, Tavus, HeyGen, etc.)
+// AudioVisualizer for waveform bars and speaking ring
+import { WaveformBars, AudioLevelMeter, useAudioLevel } from '../components/interview/AudioVisualizer.jsx'
 
-// Lazy-load livekit-client so the page still works if the package isn't
-// installed (e.g., a fresh checkout that hasn't run npm install yet).
+// ---------------------------------------------------------------------------
+// Lazy LiveKit import — keeps the page bundle small and lets the rest of the
+// app work even if `npm install` hasn't been run yet.
+// ---------------------------------------------------------------------------
 async function loadLiveKit() {
   try {
-    const mod = await import('livekit-client')
-    return mod
-  } catch {
+    return await import('livekit-client')
+  } catch (e) {
+    console.warn('livekit-client not available:', e)
     return null
   }
 }
 
-/* -------------------------------------------------------------------------- */
-/* Constants                                                                   */
-/* -------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
 
 const INTERVIEW_TYPES = [
-  {
-    id: 'hr',
-    name: 'HR',
-    icon: '🤝',
-    desc: 'Motivation, teamwork, communication, culture fit.',
-  },
-  {
-    id: 'technical',
-    name: 'Technical',
-    icon: '⚙️',
-    desc: 'Skills, projects, problem-solving, trade-offs.',
-  },
-  {
-    id: 'behavioral',
-    name: 'Behavioral',
-    icon: '🧠',
-    desc: 'STAR-format questions about past experience.',
-  },
+  { id: 'hr', name: 'HR', icon: '🤝', desc: 'Motivation, teamwork, communication, culture fit.' },
+  { id: 'technical', name: 'Technical', icon: '⚙️', desc: 'Skills, projects, problem-solving, trade-offs.' },
+  { id: 'behavioral', name: 'Behavioral', icon: '🧠', desc: 'STAR-format questions about past experience.' },
 ]
-
-const PHASES = ['setup', 'preflight', 'live', 'feedback']
 
 const QUESTION_COUNT_OPTIONS = [4, 6, 8, 10]
 
-/* -------------------------------------------------------------------------- */
-/* Small helpers                                                               */
-/* -------------------------------------------------------------------------- */
+// Data-channel topic the LiveKit agent uses to publish captions.
+const DC_TOPIC_CONTROL = 'interview.control'
 
-function formatTs(t) {
-  if (!t) return ''
-  const d = new Date(t * 1000)
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+// Helper to dynamically load the InterviewerAvatar component.
+async function loadInterviewerAvatar() {
+  const mod = await import('../components/interview/InterviewerAvatar.jsx')
+  return mod.default || null
 }
 
 function verdictLabel(v) {
@@ -59,9 +49,22 @@ function verdictLabel(v) {
   return 'OK'
 }
 
-/* -------------------------------------------------------------------------- */
-/* Setup phase                                                                 */
-/* -------------------------------------------------------------------------- */
+// Professional interviewer display names
+const INTERVIEWER_ROLE_LABELS = {
+  hr: 'Senior HR Partner • Interviewer',
+  technical: 'Software Development Engineer • Interviewer',
+  behavioral: 'Engineering Leadership • Interviewer',
+}
+
+const INTERVIEWER_ROUND_LABELS = {
+  hr: 'HR Screening Round',
+  technical: 'Technical Round',
+  behavioral: 'Behavioral Round',
+}
+
+// ---------------------------------------------------------------------------
+// Setup phase
+// ---------------------------------------------------------------------------
 
 function SetupPhase({ roles, loadingRoles, roleId, setRoleId, interviewType, setInterviewType,
                      questionCount, setQuestionCount, hasResume, error }) {
@@ -97,9 +100,7 @@ function SetupPhase({ roles, loadingRoles, roleId, setRoleId, interviewType, set
               <label className="form-label">Role</label>
               <select className="select" value={roleId} onChange={(e) => setRoleId(e.target.value)}>
                 {roles.map((r) => (
-                  <option key={r.id} value={r.id}>
-                    {r.name} ({r.level})
-                  </option>
+                  <option key={r.id} value={r.id}>{r.name} ({r.level})</option>
                 ))}
               </select>
               {roleId && (() => {
@@ -136,9 +137,7 @@ function SetupPhase({ roles, loadingRoles, roleId, setRoleId, interviewType, set
                   type="button"
                   className={`chip ${questionCount === n ? 'chip-active' : ''}`}
                   onClick={() => setQuestionCount(n)}
-                >
-                  {n}
-                </button>
+                >{n}</button>
               ))}
             </div>
           </div>
@@ -150,9 +149,9 @@ function SetupPhase({ roles, loadingRoles, roleId, setRoleId, interviewType, set
   )
 }
 
-/* -------------------------------------------------------------------------- */
-/* Pre-flight: device check                                                    */
-/* -------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
+// Pre-flight: device check
+// ---------------------------------------------------------------------------
 
 function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart, error, busy }) {
   const videoRef = useRef(null)
@@ -169,7 +168,6 @@ function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart
   const [audioInId, setAudioInId] = useState('')
   const [videoInId, setVideoInId] = useState('')
 
-  // Acquire media stream.
   useEffect(() => {
     let cancelled = false
     async function acquire() {
@@ -187,8 +185,7 @@ function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart
         if (videoRef.current) videoRef.current.srcObject = stream
         setPermError(null)
 
-        // Setup mic meter.
-        const AC = window.AudioContext || window.webkitAudioContext
+        const AC = window.AudioContext
         if (AC) {
           const ctx = new AC()
           audioCtxRef.current = ctx
@@ -213,7 +210,6 @@ function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart
           tick()
         }
 
-        // Enumerate devices (after permission grant).
         try {
           const list = await navigator.mediaDevices.enumerateDevices()
           if (!cancelled) {
@@ -239,7 +235,6 @@ function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioInId, videoInId])
 
-  // Track enable state.
   useEffect(() => {
     const s = streamRef.current
     if (!s) return
@@ -352,22 +347,15 @@ function PreflightPhase({ role, interviewType, questionCount, hasResume, onStart
   )
 }
 
-/* -------------------------------------------------------------------------- */
-/* Live phase                                                                  */
-/* -------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
+// Live phase — LiveKit-based realtime voice
+// ---------------------------------------------------------------------------
 
-function LivePhase({
-  startData,
-  onComplete,
-  onAbort,
-}) {
-  const videoRef = useRef(null)
-  const wsRef = useRef(null)
-  const mediaStreamRef = useRef(null)
-  const audioCtxRef = useRef(null)
-  const processorRef = useRef(null)
-  const sourceNodeRef = useRef(null)
-  const micOnRef = useRef(true)
+function LivePhase({ startData, onComplete, onAbort }) {
+  const userVideoRef = useRef(null)
+  const roomRef = useRef(null)
+  const avatarRef = useRef(null)
+  const cleanupRef = useRef([])
 
   const [phase, setPhase] = useState('live')
   const [transcript, setTranscript] = useState([]) // {role, text, final, ts}
@@ -376,158 +364,168 @@ function LivePhase({
   const [totalQuestions, setTotalQuestions] = useState(startData.question_count)
   const [aiSpeaking, setAiSpeaking] = useState(false)
   const [aiThinking, setAiThinking] = useState(false)
+  const [agentJoined, setAgentJoined] = useState(false)
   const [paused, setPaused] = useState(false)
   const [camOn, setCamOn] = useState(true)
   const [micOn, setMicOn] = useState(true)
   const [error, setError] = useState(null)
   const [textDraft, setTextDraft] = useState('')
+  const [connectionState, setConnectionState] = useState('connecting')
+  const [emotion, setEmotion] = useState('neutral')
+  const [AvatarComp, setAvatarComp] = useState(null)
   const completedRef = useRef(false)
 
   const roomName = startData.room_name
   const roleName = startData.role?.name || 'Interviewer'
 
-  /* --- attach local camera preview + (best-effort) LiveKit presence --- */
+  // ----- Lazy-load the InterviewerAvatar component ------------------------------
   useEffect(() => {
     let cancelled = false
-    let room = null
-    let localStream = null
-    let lkCleanup = () => {}
+    loadInterviewerAvatar().then((C) => { if (!cancelled) setAvatarComp(() => C) })
+    return () => { cancelled = true }
+  }, [])
 
-    async function setup() {
-      try {
-        localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false })
-        if (cancelled) {
-          localStream.getTracks().forEach((t) => t.stop())
-          return
-        }
-        mediaStreamRef.current = localStream
-        if (videoRef.current) videoRef.current.srcObject = localStream
-      } catch { /* ignore — fallback is no preview */ }
+  // ----- Seed the first question into the transcript immediately so the
+  // panel isn't blank waiting for the agent to join. The ParticipantConnected
+  // handler will not duplicate it.
+  useEffect(() => {
+    const q = startData?.first_question
+    if (!q) return
+    setTranscript((prev) =>
+      prev.length === 0
+        ? [{ role: 'assistant', text: q, final: true, ts: Date.now() / 1000 }]
+        : prev,
+    )
+  }, [startData?.first_question])
 
-      // Best-effort LiveKit connection (no-op if env is missing or SDK absent).
-      const lk = await loadLiveKit()
-      if (!lk) return
-      if (!startData.livekit_url || !startData.token) return
-      try {
-        room = new lk.Room({
-          adaptiveStream: true,
-          dynacast: true,
-          publishDefaults: { simulcast: false },
-        })
-        await room.connect(startData.livekit_url, startData.token)
-        if (cancelled) { room.disconnect(); return }
-        if (localStream) {
-          await room.localParticipant.setCameraEnabled(true)
-        }
-        lkCleanup = () => {
-          try { room.disconnect() } catch { /* ignore */ }
-        }
-      } catch (e) {
-        // Non-fatal — LiveKit is optional for the audio round-trip.
-        console.warn('LiveKit connection failed; continuing without presence:', e)
-      }
-    }
+  // ----- Browser TTS fallback (only used when Cartesia isn't producing audio)
+  // If the agent published a `question` DC message and we never got an audio
+  // track, we speak it locally so the avatar has something to lip-sync to.
+  const lastSpokenQuestionRef = useRef(null)
+  const audioTrackSeenRef = useRef(false)
+  const tts = useBrowserTTS({
+    onViseme: (frame) => avatarRef.current?.setViseme(frame),
+    onStart: () => { setAiSpeaking(true); setAiThinking(false) },
+    onEnd: () => { setAiSpeaking(false) },
+  })
 
-    setup()
-    return () => {
-      cancelled = true
-      lkCleanup()
-      if (mediaStreamRef.current) mediaStreamRef.current.getTracks().forEach((t) => t.stop())
-    }
+  // ----- Speak the FIRST question locally as soon as we mount, if no real
+  // agent audio track arrives within a short grace period. This guarantees
+  // the user hears the opening question even when Cartesia isn't configured
+  // and the captions-only fallback is the only path available.
+  useEffect(() => {
+    if (!tts.supported) return
+    const q = startData?.first_question
+    if (!q) return
+    lastSpokenQuestionRef.current = q
+    const t = setTimeout(() => {
+      if (!audioTrackSeenRef.current) tts.speak(q)
+    }, 600)
+    return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  useEffect(() => {
-    const s = mediaStreamRef.current
-    if (!s) return
-    s.getVideoTracks().forEach((t) => (t.enabled = camOn))
-  }, [camOn])
+  // ----- Browser STT fallback (when Deepgram isn't in the loop).
+  // We only forward final transcripts as user messages so the agent doesn't
+  // see mid-sentence fragments.
+  const sendDcRef = useRef(null) // forward-declared; assigned below
+  const pushTranscriptRef = useRef(null)
+  const stt = useSpeechRecognition({
+    onResult: ({ text, final, ts }) => {
+      if (!final || !text) return
+      // Mirror into transcript like the LiveKit path.
+      pushTranscriptRef.current?.({ role: 'user', text, final: true, ts })
+      // Send to the agent.
+      sendDcRef.current?.({ type: 'text', text })
+    },
+  })
 
-  /* --- connect to backend WebSocket and stream audio --- */
+  // ----- Connect to the LiveKit room and publish mic + camera --------------
   useEffect(() => {
     let cancelled = false
-    let ws
 
     async function connect() {
+      const lk = await loadLiveKit()
+      if (!lk) {
+        setError('livekit-client is not installed. Run `npm install` in the frontend directory.')
+        return
+      }
+      if (!startData.livekit_url || !startData.token) {
+        setError('LiveKit URL or access token missing — check your backend .env.')
+        return
+      }
+
+      const room = new lk.Room({
+        adaptiveStream: true,
+        dynacast: true,
+        publishDefaults: { simulcast: false },
+      })
+      roomRef.current = room
+
+      room.on(lk.RoomEvent.ConnectionStateChanged, (state) => {
+        setConnectionState(String(state))
+      })
+
+      room.on(lk.RoomEvent.ParticipantConnected, (participant) => {
+        // Any non-local participant arriving is treated as the agent.
+        if (participant.identity !== room.localParticipant.identity) {
+          setAgentJoined(true)
+          // Seed the very first transcript line with the pre-generated question,
+          // so the UI is never empty.
+          setTranscript((prev) =>
+            prev.length === 0
+              ? [{ role: 'assistant', text: startData.first_question, final: true, ts: Date.now() / 1000 }]
+              : prev,
+          )
+        }
+      })
+
+      room.on(lk.RoomEvent.ParticipantDisconnected, (participant) => {
+        if (participant.identity !== room.localParticipant.identity) {
+          // The agent left — treat this as the interview ending.
+          if (!completedRef.current) finishInterview()
+        }
+      })
+
+      room.on(lk.RoomEvent.DataReceived, (payload, _participant, _kind, _topic) => {
+        // Decode the agent's JSON captions and control events.
+        try {
+          const text = new TextDecoder().decode(payload)
+          const msg = JSON.parse(text)
+          handleDcMessage(msg)
+        } catch (e) {
+          console.warn('bad data-channel payload', e)
+        }
+      })
+
+      room.on(lk.RoomEvent.TrackSubscribed, (track, _pub, participant) => {
+        if (track.kind === lk.Track.Kind.Audio && participant.identity !== room.localParticipant.identity) {
+          // Attach the agent's audio to the default output.
+          audioTrackSeenRef.current = true
+          const el = track.attach()
+          el.id = 'lk-agent-audio'
+          document.body.appendChild(el)
+          cleanupRef.current.push(() => {
+            try { el.remove() } catch { /* ignore */ }
+          })
+          // Cancel any browser-TTS fallback that's still playing.
+          tts.cancel()
+          setAiSpeaking(true)
+        }
+      })
+
       try {
-        // Acquire a stream that we keep open for the whole interview.
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000, channelCount: 1 },
-          video: false,
-        })
-        if (cancelled) {
-          stream.getTracks().forEach((t) => t.stop())
-          return
-        }
-        mediaStreamRef.current = stream
-
-        // Build ws URL — same host:port as the page.
-        const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-        const wsUrl = `${proto}//${window.location.host}/api/interview/ws/${startData.interview_id}`
-
-        ws = new WebSocket(wsUrl)
-        ws.binaryType = 'arraybuffer'
-        wsRef.current = ws
-
-        ws.onopen = () => {
-          ws.send(JSON.stringify({
-            type: 'config',
-            role_id: startData.role.id,
-            interview_type: startData.interview_type,
-            question_count: startData.question_count,
-            resume_text: null, // Backend already got it via /token; send null to skip.
-          }))
-          // Set up audio pipeline.
-          try {
-            const Ctor = /** @type {any} */ (window).AudioContext
-              || /** @type {any} */ (window).webkitAudioContext
-            const ctx = new Ctor({ sampleRate: 16000 })
-            audioCtxRef.current = ctx
-            const src = ctx.createMediaStreamSource(stream)
-            sourceNodeRef.current = src
-            // ScriptProcessor is deprecated but the most universally supported
-            // path for live PCM capture across browsers (AudioWorklet would need
-            // a separate worker file). This is the audio capture path for STT.
-            const proc = /** @type {any} */ (ctx).createScriptProcessor(4096, 1, 1)
-            processorRef.current = proc
-            /** @type {any} */ (proc).onaudioprocess = (e) => {
-              if (!micOnRef.current) return
-              if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-                const input = /** @type {any} */ (e).inputBuffer.getChannelData(0)
-                // Convert Float32 → Int16 PCM
-                const pcm = new Int16Array(input.length)
-                for (let i = 0; i < input.length; i++) {
-                  let s = Math.max(-1, Math.min(1, input[i]))
-                  pcm[i] = s < 0 ? s * 0x8000 : s * 0x7fff
-                }
-                wsRef.current.send(pcm.buffer)
-              }
-            }
-            src.connect(proc)
-            // Connect processor to a muted gain so it actually fires.
-            const mute = ctx.createGain()
-            mute.gain.value = 0
-            proc.connect(mute)
-            mute.connect(ctx.destination)
-          } catch (e) {
-            console.warn('Audio pipeline setup failed', e)
-          }
-        }
-
-        ws.onmessage = (ev) => {
-          if (typeof ev.data !== 'string') return
-          let msg
-          try { msg = JSON.parse(ev.data) } catch { return }
-          handleWsMessage(msg)
-        }
-
-        ws.onerror = () => setError('Realtime connection error. Check the backend logs.')
-        ws.onclose = () => {
-          // If we closed unexpectedly, do nothing special — the cleanup
-          // runs and the user sees the spinner/feedback screen.
+        await room.connect(startData.livekit_url, startData.token)
+        if (cancelled) { room.disconnect(); return }
+        await room.localParticipant.setMicrophoneEnabled(true)
+        await room.localParticipant.setCameraEnabled(true)
+        // Attach our own camera preview.
+        const camPub = room.localParticipant.getTrackPublication(lk.Track.Source.Camera)
+        if (camPub?.videoTrack && userVideoRef.current) {
+          userVideoRef.current.srcObject = new MediaStream([camPub.videoTrack.mediaStreamTrack])
         }
       } catch (e) {
-        if (!cancelled) setError(e.message || 'Failed to start audio stream.')
+        if (!cancelled) setError(e?.message || 'Could not connect to LiveKit room.')
       }
     }
 
@@ -535,34 +533,58 @@ function LivePhase({
 
     return () => {
       cancelled = true
-      try { if (ws) ws.close() } catch { /* ignore */ }
-      try { if (processorRef.current) processorRef.current.disconnect() } catch { /* ignore */ }
-      try { if (sourceNodeRef.current) sourceNodeRef.current.disconnect() } catch { /* ignore */ }
-      if (audioCtxRef.current && audioCtxRef.current.state !== 'closed') {
-        audioCtxRef.current.close().catch(() => {})
-      }
+      try { roomRef.current?.disconnect() } catch { /* ignore */ }
+      cleanupRef.current.forEach((fn) => { try { fn() } catch { /* ignore */ } })
+      cleanupRef.current = []
+      // Cancel any active browser TTS/STT so audio doesn't leak past unmount.
+      try { tts.cancel() } catch { /* ignore */ }
+      try { stt.stop() } catch { /* ignore */ }
+      avatarRef.current?.resetExpression()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Keep mic state in sync — separate effect so it doesn't tear down the WS.
+  // ----- Control mic/camera on the LocalParticipant ------------------------
   useEffect(() => {
-    micOnRef.current = micOn
+    const room = roomRef.current
+    if (!room) return
+    room.localParticipant.setMicrophoneEnabled(micOn).catch(() => {})
   }, [micOn])
 
-  /* --- handle incoming WS messages --- */
-  const handleWsMessage = useCallback((msg) => {
-    const t = msg.type
+  useEffect(() => {
+    const room = roomRef.current
+    if (!room) return
+    room.localParticipant.setCameraEnabled(camOn).catch(() => {})
+  }, [camOn])
+
+  // ----- Data-channel message handling -------------------------------------
+  const handleDcMessage = useCallback((msg) => {
+    const t = msg?.type
+    if (!t) return
     if (t === 'question') {
-      setCurrentQuestion(msg.text)
+      setCurrentQuestion(msg.text || '')
       setQuestionIndex(msg.index ?? 0)
       if (typeof msg.total === 'number') setTotalQuestions(msg.total)
       setAiSpeaking(false)
       setAiThinking(false)
-      setTranscript((prev) => [...prev, { role: 'assistant', text: msg.text, final: true, ts: msg.timestamp || Date.now() / 1000 }])
+      setTranscript((prev) => [
+        ...prev,
+        { role: 'assistant', text: msg.text || '', final: true, ts: Date.now() / 1000 },
+      ])
+      // If no LiveKit audio track arrived within a short grace period, speak
+      // the question locally so the avatar has something to lip-sync to.
+      // This is the captions-only mode fallback.
+      if (!audioTrackSeenRef.current && msg.text && msg.text !== lastSpokenQuestionRef.current) {
+        lastSpokenQuestionRef.current = msg.text
+        if (tts.supported) {
+          setTimeout(() => {
+            if (!audioTrackSeenRef.current) tts.speak(msg.text)
+          }, 800)
+        }
+      }
     } else if (t === 'caption') {
       const role = msg.role === 'user' ? 'user' : 'assistant'
-      const text = msg.text
+      const text = msg.text || ''
       const isFinal = !!msg.final
       setTranscript((prev) => {
         if (!isFinal && prev.length && prev[prev.length - 1].role === role && !prev[prev.length - 1].final) {
@@ -572,35 +594,66 @@ function LivePhase({
         }
         return [...prev, { role, text, final: isFinal, ts: Date.now() / 1000 }]
       })
-      if (role === 'assistant' && isFinal) {
-        setAiSpeaking(true)
-      }
+      if (role === 'assistant' && isFinal) setAiSpeaking(true)
     } else if (t === 'ai_thinking') {
       setAiThinking(true)
       setAiSpeaking(false)
+      avatarRef.current?.setExpression('think', 0.7)
     } else if (t === 'ai_done') {
       setAiThinking(false)
       setAiSpeaking(false)
-    } else if (t === 'ai_timeout') {
-      setAiThinking(false)
-    } else if (t === 'paused') {
-      setPaused(true)
-    } else if (t === 'resumed') {
-      setPaused(false)
+    } else if (t === 'expression') {
+      // Agent told us what emotion to display before speaking.
+      const label = msg.emotion || 'neutral'
+      const intensity = typeof msg.intensity === 'number' ? msg.intensity : 0.6
+      setEmotion(label)
+      avatarRef.current?.setExpression(label, intensity)
+    } else if (t === 'viseme') {
+      // Per-frame mouth/blink data — drives the avatar during TTS.
+      avatarRef.current?.setViseme({
+        mouthOpen: msg.mouthOpen ?? 0,
+        smile: msg.smile ?? 0,
+        browRaise: msg.browRaise ?? 0,
+        blink: msg.blink ?? 0,
+        ts: msg.ts,
+      })
+      if ((msg.mouthOpen ?? 0) > 0.05) {
+        setAiSpeaking(true)
+        setAiThinking(false)
+      }
     } else if (t === 'complete') {
       completedRef.current = true
       finishInterview()
     } else if (t === 'error') {
       setError(msg.message || 'Realtime error.')
     }
+  }, [tts])
+
+  // ----- Send control messages back over the data channel ------------------
+  const sendDc = useCallback((obj) => {
+    const room = roomRef.current
+    if (!room) return
+    const enc = new TextEncoder().encode(JSON.stringify(obj))
+    try {
+      room.localParticipant.publishData(enc, { reliable: true, topic: DC_TOPIC_CONTROL })
+    } catch (e) {
+      console.warn('publishData failed', e)
+    }
   }, [])
 
-  /* --- finish: collect transcript, call feedback endpoint --- */
+  // Keep the imperative sendDc reachable from the STT hook.
+  useEffect(() => { sendDcRef.current = sendDc }, [sendDc])
+
+  // Helper used by STT and the text-input box to push a transcript line.
+  const pushTranscript = useCallback((entry) => {
+    setTranscript((prev) => [...prev, entry])
+  }, [])
+  useEffect(() => { pushTranscriptRef.current = pushTranscript }, [pushTranscript])
+
   const finishInterview = useCallback(async () => {
     setPhase('finalizing')
     try {
-      // Close the WS.
-      try { wsRef.current?.close() } catch { /* ignore */ }
+      try { roomRef.current?.disconnect() } catch { /* ignore */ }
       const turns = transcript
         .filter((t) => t.final)
         .map((t) => ({ role: t.role, text: t.text, timestamp: t.ts }))
@@ -617,22 +670,15 @@ function LivePhase({
     }
   }, [transcript, startData, onComplete])
 
-  /* --- controls --- */
-  const sendCtrl = (obj) => {
-    try {
-      wsRef.current?.send(JSON.stringify(obj))
-    } catch { /* ignore */ }
-  }
-
   const onPauseToggle = () => {
-    if (paused) sendCtrl({ type: 'resume' })
-    else sendCtrl({ type: 'pause' })
+    if (paused) sendDc({ type: 'resume' })
+    else sendDc({ type: 'pause' })
+    setPaused((v) => !v)
   }
 
   const onEnd = () => {
     if (completedRef.current) return
-    sendCtrl({ type: 'end' })
-    // Force-complete in case server didn't get to send 'complete'.
+    sendDc({ type: 'end' })
     setTimeout(() => {
       if (!completedRef.current) {
         completedRef.current = true
@@ -641,15 +687,18 @@ function LivePhase({
     }, 600)
   }
 
-  const onSkip = () => {
-    sendCtrl({ type: 'skip' })
-  }
+  const onSkip = () => sendDc({ type: 'skip' })
 
   const onSendText = () => {
     const text = textDraft.trim()
     if (!text) return
     setTextDraft('')
-    sendCtrl({ type: 'text', text })
+    sendDc({ type: 'text', text })
+    // Mirror it into the transcript so the user sees their message.
+    setTranscript((prev) => [
+      ...prev,
+      { role: 'user', text, final: true, ts: Date.now() / 1000 },
+    ])
   }
 
   const onCamToggle = () => setCamOn((v) => !v)
@@ -670,143 +719,226 @@ function LivePhase({
 
   return (
     <>
-      <div className="interview-config-summary">
-        <span className="pill pill-success">{startData.role.name}</span>
-        <span className="pill">{startData.interview_type.toUpperCase()}</span>
-        <span className="pill">Room: {roomName}</span>
-        {paused && <span className="pill pill-warning">Paused</span>}
+      <div className="interview-header-bar">
+        <div className="interview-header-left">
+          <span className="pill pill-success">{startData.role.name}</span>
+          <span className="pill">{startData.interview_type.toUpperCase()}</span>
+        </div>
+        <div className="interview-header-center">
+          <span className="interview-status-badge">
+            <span className={`status-dot ${aiThinking ? 'thinking' : aiSpeaking ? 'speaking' : agentJoined ? 'live' : 'connecting'}`} />
+            {aiThinking ? 'AI thinking…' : aiSpeaking ? 'AI speaking' : agentJoined ? 'Live' : 'Connecting…'}
+            {!agentJoined && connectionState !== 'connected' && ` (${connectionState})`}
+          </span>
+        </div>
+        <div className="interview-header-right">
+          {paused && <span className="pill pill-warning">Paused</span>}
+        </div>
       </div>
 
-      <div className="interview-stage">
-        {/* --- Call tiles: AI avatar + user PiP --- */}
-        <div className="call-tiles">
-          <div className="avatar-tile">
-            <div className="ai-status">
-              <span className="dot-live" />
-              {aiThinking ? 'AI thinking…' : aiSpeaking ? 'AI speaking' : 'Live'}
-            </div>
-            <div className="avatar-figure">
-              <div className={`avatar-circle ${aiSpeaking && !aiThinking ? 'speaking' : ''}`}>
-                🤖
-              </div>
-              <div className="avatar-name">{roleName} · Interviewer</div>
-              <div className="avatar-role">{INTERVIEW_TYPES.find((t) => t.id === startData.interview_type)?.name} round</div>
-            </div>
-          </div>
+      <div className="interview-main-grid">
+        {/* LEFT PANEL - Interviewer Avatar */}
+        <div className="interviewer-panel">
+          <div className="interviewer-avatar-container">
+            <div className="interviewer-avatar-wrapper">
+              {AvatarComp ? (
+                <AvatarComp
+                  ref={avatarRef}
+                  provider={startData.avatar_provider || 'local'}
+                  session={startData.avatar_session}
+                  state={aiThinking ? 'thinking' : aiSpeaking ? 'speaking' : paused ? 'paused' : 'idle'}
+                  onViseme={(frame) => avatarRef.current?.setViseme?.(frame)}
+                  onExpression={(label, intensity) => avatarRef.current?.setExpression?.(label, intensity)}
+                  style={{ width: '100%', height: '100%' }}
+                />
+              ) : (
+                // Professional fallback while component loads
+                <div className="interviewer-fallback" data-state={aiThinking ? 'thinking' : aiSpeaking ? 'speaking' : paused ? 'paused' : 'idle'}>
+                  <div className="interviewer-silhouette" />
+                  {aiSpeaking && <div className="speaking-ring" />}
+                  {aiThinking && <div className="thinking-pulse" />}
+                  {!aiSpeaking && !aiThinking && <div className="breathing-ring" />}
+                </div>
+              )}
 
-          <div className={`user-pip ${camOn ? '' : 'muted-cam'}`}>
-            {camOn ? (
-              <video ref={videoRef} autoPlay playsInline muted />
-            ) : (
-              <div className="preview-placeholder">
-                <div className="big-emoji" style={{ fontSize: '1.6rem' }}>📷</div>
-                <span>Camera off</span>
+              {/* Candidate self-preview - bottom right of interviewer */}
+              <div className={`candidate-preview ${camOn ? '' : 'muted'}`}>
+                {camOn ? (
+                  <video ref={userVideoRef} autoPlay playsInline muted />
+                ) : (
+                  <div className="preview-placeholder">
+                    <span className="camera-icon">📷</span>
+                    <span>Camera off</span>
+                  </div>
+                )}
+                <span className="preview-label">You</span>
               </div>
-            )}
-            <span className="pip-label">You</span>
-          </div>
+            </div>
 
-          <div className="controls-bar" role="toolbar" aria-label="Interview controls">
-            <button
-              type="button"
-              className={`ctrl-btn ${micOn ? '' : 'off'}`}
-              title={micOn ? 'Mute mic' : 'Unmute mic'}
-              aria-label={micOn ? 'Mute mic' : 'Unmute mic'}
-              onClick={onMicToggle}
-            >{micOn ? '🎙️' : '🔇'}</button>
-            <button
-              type="button"
-              className={`ctrl-btn ${camOn ? '' : 'off'}`}
-              title={camOn ? 'Turn camera off' : 'Turn camera on'}
-              aria-label={camOn ? 'Turn camera off' : 'Turn camera on'}
-              onClick={onCamToggle}
-            >{camOn ? '📹' : '🎬'}</button>
-            <button
-              type="button"
-              className="ctrl-btn"
-              title={paused ? 'Resume' : 'Pause'}
-              aria-label={paused ? 'Resume' : 'Pause'}
-              onClick={onPauseToggle}
-            >{paused ? '▶️' : '⏸️'}</button>
-            <button
-              type="button"
-              className="ctrl-btn"
-              title="Skip question"
-              aria-label="Skip question"
-              onClick={onSkip}
-            >⏭️</button>
-            <button
-              type="button"
-              className="ctrl-btn danger"
-              title="End interview"
-              aria-label="End interview"
-              onClick={onEnd}
-            >⏹️</button>
+            {/* Interviewer title & round label */}
+            <div className="interviewer-info">
+              <div className="interviewer-title">
+                {INTERVIEWER_ROLE_LABELS[startData.interview_type] || 'Senior Interviewer'}
+              </div>
+              <div className="interviewer-round">
+                {INTERVIEWER_ROUND_LABELS[startData.interview_type] || `${startData.interview_type.charAt(0).toUpperCase() + startData.interview_type.slice(1)} Round`}
+              </div>
+            </div>
           </div>
         </div>
 
-        {/* --- Side: progress + question + transcript --- */}
-        <div className="interview-side">
-          <div className="progress-row">
-            <span className="progress-text">
-              Question {Math.min(questionIndex + 1, totalQuestions)} of {totalQuestions}
-            </span>
+        {/* RIGHT PANEL - Controls & Content */}
+        <div className="interview-sidebar">
+          {/* Controls Bar - fixed at top of sidebar */}
+          <div className="sidebar-controls" role="toolbar" aria-label="Interview controls">
+            <button
+              type="button"
+              className={`sidebar-btn ${micOn ? '' : 'off'}`}
+              title={micOn ? 'Mute microphone' : 'Unmute microphone'}
+              onClick={onMicToggle}
+              aria-pressed={!micOn}
+            >
+              <span className="btn-icon">{micOn ? '🎙️' : '🔇'}</span>
+              <span className="btn-label">{micOn ? 'Mute' : 'Unmute'}</span>
+            </button>
+            {stt.supported && (
+              <button
+                type="button"
+                className={`sidebar-btn ${stt.listening ? 'active' : ''}`}
+                title={stt.listening ? 'Stop voice recognition' : 'Start voice recognition'}
+                onClick={() => stt.toggle()}
+                aria-pressed={stt.listening}
+              >
+                <span className="btn-icon">{stt.listening ? '🎤' : '🗣️'}</span>
+                <span className="btn-label">{stt.listening ? 'Listening' : 'Voice'}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              className={`sidebar-btn ${camOn ? '' : 'off'}`}
+              title={camOn ? 'Turn camera off' : 'Turn camera on'}
+              onClick={onCamToggle}
+              aria-pressed={!camOn}
+            >
+              <span className="btn-icon">{camOn ? '📹' : '🎬'}</span>
+              <span className="btn-label">{camOn ? 'Camera Off' : 'Camera On'}</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-btn"
+              title={paused ? 'Resume interview' : 'Pause interview'}
+              onClick={onPauseToggle}
+              aria-pressed={paused}
+            >
+              <span className="btn-icon">{paused ? '▶️' : '⏸️'}</span>
+              <span className="btn-label">{paused ? 'Resume' : 'Pause'}</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-btn"
+              title="Skip question"
+              onClick={onSkip}
+            >
+              <span className="btn-icon">⏭️</span>
+              <span className="btn-label">Skip</span>
+            </button>
+            <button
+              type="button"
+              className="sidebar-btn danger"
+              title="End interview"
+              onClick={onEnd}
+            >
+              <span className="btn-icon">⏹️</span>
+              <span className="btn-label">End</span>
+            </button>
+          </div>
+
+          {stt.supported && stt.listening && (
+            <div className="stt-hint">
+              <span className="listening-indicator" />
+              Listening… {stt.interim ? `"${stt.interim}"` : ''}
+            </div>
+          )}
+          {stt.supported === false && (
+            <div className="stt-hint warning">
+              Voice recognition unavailable — type your answer below.
+            </div>
+          )}
+
+          {/* Progress Section */}
+          <div className="sidebar-section progress-section">
+            <div className="progress-header">
+              <span className="progress-text">
+                Question {Math.min(questionIndex + 1, totalQuestions)} of {totalQuestions}
+              </span>
+              <span className="progress-pct">{progressPct}%</span>
+            </div>
             <div className="progress-bar"><div className="progress-bar-fill" style={{ width: `${progressPct}%` }} /></div>
           </div>
 
-          <div className="card question-card">
-            <div className="q-label">Current question</div>
-            <p className="q-text">{currentQuestion}</p>
+          {/* Current Question Card */}
+          <div className="sidebar-section question-section">
+            <div className="section-label">Current Question</div>
+            <div className="question-card">
+              <p className="question-text">{currentQuestion}</p>
+            </div>
           </div>
 
-          <div className="card transcript-card">
-            <div className="t-header">
-              <h3>Live transcript</h3>
+          {/* Live Transcript */}
+          <div className="sidebar-section transcript-section">
+            <div className="section-header">
+              <h3>Live Transcript</h3>
               <span className="muted small">{transcript.length} line{transcript.length === 1 ? '' : 's'}</span>
             </div>
             <div className="transcript-list">
               {transcript.length === 0 && (
-                <p className="muted small">Speak or type to see captions here.</p>
+                <p className="transcript-empty">Waiting for interview to begin…</p>
               )}
               {transcript.map((line, i) => (
                 <div key={i} className={`transcript-line ${line.role} ${line.final ? '' : 'interim'}`}>
-                  <span className="t-role">{line.role === 'user' ? 'You' : 'AI'}</span>
+                  <span className="t-role">{line.role === 'user' ? 'You' : 'Interviewer'}</span>
                   <span className="t-text">{line.text}</span>
                 </div>
               ))}
               {aiThinking && (
                 <div className="transcript-line assistant interim">
-                  <span className="t-role">AI</span>
-                  <span className="t-text">
-                    <span className="typing"><span /><span /><span /></span>
-                  </span>
+                  <span className="t-role">Interviewer</span>
+                  <span className="t-text"><span className="typing"><span /><span /><span /></span></span>
                 </div>
               )}
             </div>
+          </div>
 
-            <div className="text-fallback">
-              <p className="muted">Voice not working? Type your answer instead.</p>
-              <div className="chat-input-row">
-                <input
-                  className="chat-input"
-                  placeholder="Type your answer…"
-                  value={textDraft}
-                  onChange={(e) => setTextDraft(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') onSendText() }}
-                  disabled={paused || phase !== 'live'}
-                />
-                <button type="button" className="btn btn-primary" onClick={onSendText} disabled={!textDraft.trim()}>
-                  Send
-                </button>
-              </div>
+          {/* Text Fallback Input */}
+          <div className="sidebar-section input-section">
+            <div className="section-label">Type Your Answer</div>
+            <div className="chat-input-row">
+              <input
+                className="chat-input"
+                placeholder="Type your answer and press Enter…"
+                value={textDraft}
+                onChange={(e) => setTextDraft(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); onSendText() }}}
+                disabled={paused || phase !== 'live'}
+                autoFocus
+              />
+              <button
+                type="button"
+                className="btn btn-primary send-btn"
+                onClick={onSendText}
+                disabled={!textDraft.trim() || paused || phase !== 'live'}
+              >
+                Send
+              </button>
             </div>
           </div>
 
-          {error && <div className="form-error">{error}</div>}
+          {error && <div className="form-error sidebar-error">{error}</div>}
 
-          <div className="btn-row">
-            <button type="button" className="btn btn-danger" onClick={onEnd}>End interview</button>
-            <button type="button" className="btn" onClick={onAbort}>Cancel</button>
+          {/* Footer Actions */}
+          <div className="sidebar-footer">
+            <button type="button" className="btn btn-danger btn-full" onClick={onEnd}>End Interview</button>
+            <button type="button" className="btn btn-secondary btn-full" onClick={onAbort}>Cancel & Exit</button>
           </div>
         </div>
       </div>
@@ -814,9 +946,9 @@ function LivePhase({
   )
 }
 
-/* -------------------------------------------------------------------------- */
-/* Feedback phase                                                              */
-/* -------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
+// Feedback phase (unchanged)
+// ---------------------------------------------------------------------------
 
 function FeedbackPhase({ feedback, turns, role, interviewType, onRetry }) {
   if (!feedback) return null
@@ -848,7 +980,6 @@ function FeedbackPhase({ feedback, turns, role, interviewType, onRetry }) {
               <span className="score-of">out of 100</span>
             </div>
           </div>
-
           <div className="sub-scores">
             <SubScore label="Communication" value={score.communication} />
             <SubScore label="Technical" value={score.technical_knowledge} />
@@ -863,7 +994,6 @@ function FeedbackPhase({ feedback, turns, role, interviewType, onRetry }) {
           ) : (
             <p className="muted">No summary available.</p>
           )}
-
           <h4 style={{ marginTop: 14, marginBottom: 6 }}>💪 Strengths</h4>
           {strengths.length === 0 ? (
             <p className="muted small">No strengths highlighted.</p>
@@ -872,7 +1002,6 @@ function FeedbackPhase({ feedback, turns, role, interviewType, onRetry }) {
               {strengths.map((s, i) => <li key={i}>{s}</li>)}
             </ul>
           )}
-
           <h4 style={{ marginTop: 14, marginBottom: 6 }}>🎯 Areas to improve</h4>
           {areas_for_improvement.length === 0 ? (
             <p className="muted small">No specific areas flagged.</p>
@@ -945,23 +1074,19 @@ function QACard({ qa }) {
         <span className="muted small">{score}/100</span>
       </div>
       <div className="qa-q">{qa.question}</div>
-      {qa.answer_snippet && (
-        <div className="qa-a">"{qa.answer_snippet}"</div>
-      )}
+      {qa.answer_snippet && <div className="qa-a">"{qa.answer_snippet}"</div>}
       <div className="qa-score"><div><div style={{ width: `${score}%` }} /></div></div>
       {qa.comment && <div className="qa-comment"><strong>Coach:</strong> {qa.comment}</div>}
       {qa.suggested_answer && (
-        <div className="qa-suggested">
-          <strong>Try instead:</strong> {qa.suggested_answer}
-        </div>
+        <div className="qa-suggested"><strong>Try instead:</strong> {qa.suggested_answer}</div>
       )}
     </div>
   )
 }
 
-/* -------------------------------------------------------------------------- */
-/* Main page                                                                   */
-/* -------------------------------------------------------------------------- */
+// ---------------------------------------------------------------------------
+// Page entrypoint
+// ---------------------------------------------------------------------------
 
 export default function Interview() {
   const { current } = useHistory()
@@ -1013,9 +1138,7 @@ export default function Interview() {
   }
 
   const handlePreflightStart = async ({ stream, camOn, micOn }) => {
-    // Keep the stream around so the Live phase can reuse it.
     if (stream) {
-      // Stash on the startData so the Live phase picks it up.
       setStartData((prev) => ({ ...prev, _stream: stream, _camOn: camOn, _micOn: micOn }))
     }
     setPhase('live')
