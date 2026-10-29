@@ -1,3 +1,4 @@
+
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
   "services": {
@@ -5,8 +6,7 @@
       "root": "ats-resume-analyzer/backend",
       "framework": "fastapi",
       "entrypoint": "app.main:app",
-      "buildCommand": "pip install -r requirements.txt",
-      "runtime": "python3.11"
+      "buildCommand": "pip install -r requirements.txt"
     },
     "frontend": {
       "root": "ats-resume-analyzer/frontend",
@@ -14,7 +14,12 @@
       "buildCommand": "npm run build",
       "outputDirectory": "dist",
       "bindings": [
-        { "type": "service", "service": "backend", "format": "url", "env": "VITE_BACKEND_URL" }
+        {
+          "type": "service",
+          "service": "backend",
+          "format": "url",
+          "env": "VITE_BACKEND_URL"
+        }
       ]
     }
   },
