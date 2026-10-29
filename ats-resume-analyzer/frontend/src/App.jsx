@@ -8,9 +8,6 @@ import Results from './pages/Results.jsx'
 import Chat from './pages/Chat.jsx'
 import Improver from './pages/Improver.jsx'
 import IdealResumes from './pages/IdealResumes.jsx'
-import Compare from './pages/Compare.jsx'
-import Interview from './pages/Interview.jsx'
-import RoleMatcher from './pages/RoleMatcher.jsx'
 import History from './pages/History.jsx'
 import Settings from './pages/Settings.jsx'
 
@@ -26,9 +23,6 @@ export default function App() {
             <Route path="chat" element={<Chat />} />
             <Route path="improver" element={<Improver />} />
             <Route path="ideal" element={<IdealResumes />} />
-            <Route path="compare" element={<Compare />} />
-            <Route path="interview" element={<Interview />} />
-            <Route path="matcher" element={<RoleMatcher />} />
             <Route path="history" element={<History />} />
             <Route path="settings" element={<Settings />} />
             <Route path="*" element={<Navigate to="/" replace />} />

@@ -6,9 +6,6 @@ const NAV = [
   { to: '/chat', label: 'AI Resume Chat', icon: '💬' },
   { to: '/improver', label: 'Resume Improver', icon: '✨' },
   { to: '/ideal', label: 'Ideal Resumes', icon: '🎯' },
-  { to: '/matcher', label: 'Job Role Match', icon: '🧭' },
-  { to: '/compare', label: 'Compare', icon: '⚖️' },
-  { to: '/interview', label: 'Interview', icon: '🎤' },
   { to: '/history', label: 'History', icon: '🕒' },
   { to: '/settings', label: 'Settings', icon: '⚙️' },
 ]
