@@ -1,3 +1,4 @@
+
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 python-multipart==0.0.12
@@ -10,21 +11,19 @@ httpx==0.27.2
 python-dotenv==1.0.1
 pydantic==2.9.2
 
-# LiveKit — voice room infrastructure (token minting + room API)
+# LiveKit — voice room infrastructure
 livekit==0.12.0
-livekit-api>=1.0.0
+livekit-api>=0.10.0,<1.0.0
 
-# LiveKit Agents — runs the realtime voice pipeline (STT, TTS, VAD, turn-taking)
-# Plugins: Deepgram (STT), Cartesia (TTS), Silero (VAD), OpenAI LLM adapter
-livekit-agents[deepgram,openai]~=1.2
-livekit-plugins-cartesia~=1.2
-livekit-plugins-silero~=1.2
-livekit-plugins-turn-detector~=1.2
+# LiveKit Agents — compatible 1.2 generation
+livekit-agents[deepgram,openai]==1.2.18
+livekit-plugins-cartesia==1.2.18
+livekit-plugins-silero==1.2.18
+livekit-plugins-turn-detector==1.2.18
 livekit-plugins-noise-cancellation~=0.2
 
-# LangGraph + LangChain — drives the interview state machine, exposed to
-# LiveKit Agents through `livekit.plugins.langchain.LLMAdapter`.
+# LangChain integration
 livekit-plugins-langchain~=1.1
 langgraph>=0.2
 langchain-core>=0.3
-langchain-openai>=0.3
+langchain-openai>=0.3,<0.4
